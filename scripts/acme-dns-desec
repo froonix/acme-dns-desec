@@ -351,9 +351,6 @@ class deSEC
 
 	public function getRecord($domain, $name = null, $type = null)
 	{
-		# TODO: Implement pagination!
-		# ...
-
 		try
 		{
 			$query = http_build_query
