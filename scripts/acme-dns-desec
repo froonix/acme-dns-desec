@@ -1,0 +1,480 @@
+#!/usr/bin/env php
+<?php
+/**********************************************************************
+ *                                                                    *
+ *                           ACME-DNS-DESEC                           *
+ * ------------------------------------------------------------------ *
+ *                      v0.1.0-DEV (XXXX-XX-XX)                       *
+ *                                                                    *
+ * Author:  Christian Schrötter <cs@fnx.li>                           *
+ * License: GNU GENERAL PUBLIC LICENSE (Version 3)                    *
+ * Website: https://github.com/froonix/acme-dns-desec                 *
+ *                                                                    *
+ **********************************************************************/
+
+set_error_handler('error_handler');
+error_reporting(-1);
+
+if(version_compare(PHP_VERSION, '5.5.0', '<'))
+{
+	throw new Exception('PHP 5.5.0 or newer is required');
+}
+else if(!extension_loaded('curl') || !extension_loaded('json'))
+{
+	throw new Exception('Required modules not found: cURL and JSON');
+}
+else if(PHP_SAPI !== 'cli')
+{
+	throw new Exception('This script is for CLI execution only');
+}
+
+$mode = null;
+$base = array_shift($argv);
+
+if(isset($argv[0]) && substr($argv[0], 0, 2) === '--')
+{
+	$_ = substr(array_shift($argv), 2);
+	if(in_array($_, ['add', 'del', 'cleanup'], true))
+	{
+		$mode = $_;
+	}
+	unset($_);
+}
+else if(isset($argv[1]))
+{
+	$mode = 'add';
+}
+else if(isset($argv[0]))
+{
+	$mode = 'del';
+}
+
+if($mode === 'cleanup')
+{
+	$domains = $argv;
+
+	if(!count($domains))
+	{
+		$mode = null;
+	}
+}
+else
+{
+	$hostname    = array_shift($argv);
+	$recordvalue = array_shift($argv);
+
+	if(count($argv))
+	{
+		$mode = null;
+	}
+}
+
+if($mode === null || ($mode === 'add' && ($hostname === null || $recordvalue === null)) || ($mode === 'del' && $hostname === null))
+{
+	print("[ACME-DNS-DESEC] dns-01 challenge helper script for deSEC.io DNS API\n");
+	printf("Usage: %s [--{add|del}] <hostname> [<txtvalue>]\n", $base);
+	printf("       %s --cleanup <domain> ...\n\n", $base);
+	print("_acme-challenge will be prepended to the hostname. Subdomains are fully supported.\n");
+	print("Without a txtvalue, the corresponding record will be deleted! TTL is set to 3600.\n\n");
+	print("There are --add/--del arguments too. They are only supported as first argument!\n");
+	print("Calling --del without a txtvalue removes all records for the challenge hostname.\n\n");
+	print("It's required to place a file called .desec.ini in your home directory. Example configuration below:\n\n");
+	print("  token = \"your deSEC.io token\"\n\n");
+	print("Required:    PHP 5.5 or newer and cURL/JSON extensions.\n");
+	print("Recommended: PHP INTL extension for IDN (Punycode) support.\n");
+	print("BT & Wiki:   https://github.com/froonix/acme-dns-desec\n\n");
+	print("Usage examples:\n\n");
+	print("  # Add TXT record _acme-challenge.example.org with content \"123\"\n");
+	printf("  %s example.org 123\n\n", $base);
+	print("  # Add TXT record _acme-challenge.example.org with content \"123\"\n");
+	printf("  %s --add example.org 123\n\n", $base);
+	print("  # Delete TXT record _acme-challenge.example.org with content \"123\"\n");
+	printf("  %s --del example.org 123\n\n", $base);
+	print("  # Delete all TXT records for _acme-challenge.example.org\n");
+	printf("  %s --del example.org\n\n", $base);
+	print("  # Delete all TXT records for _acme-challenge.example.org\n");
+	printf("  %s example.org\n\n", $base);
+	print("  # Delete all challenge records at example.org (incl. subdomains)\n");
+	printf("  %s --cleanup example.org\n\n", $base);
+	exit(1);
+}
+
+if($mode !== 'cleanup')
+{
+	$hostname = strtolower($hostname);
+	if(substr($hostname, 0, 16) === '_acme-challenge.')
+	{
+		$hostname = substr($hostname, 16);
+	}
+}
+
+# TODO: Read path from ENV var?
+# ...
+
+$ini = parse_ini_file($_SERVER['HOME'] . '/.desec.ini');
+
+// DON'T MOVE THIS PART INTO THE CLASS!
+openlog(strtoupper(basename(__file__)), LOG_PID, LOG_USER);
+
+$desec = new deSEC();
+$desec->setAuthData($ini['token']);
+
+if($mode === 'cleanup')
+{
+	$deleted = 0;
+	foreach($domains as $domain)
+	{
+		$result = $desec->getRecord($domain, null, 'TXT');
+
+		if(is_array($result))
+		{
+			foreach($result as $rr)
+			{
+				if(preg_match('/^_acme-challenge(\..+|$)/', $rr['subname']))
+				{
+					printf("Deleting TXT record for %s: %s\n", $rr['subname'], implode(' ', $rr['records']));
+					$desec->deleteRecord($rr['domain'], $rr['subname'], $rr['type']);
+					$deleted++;
+				}
+			}
+		}
+	}
+
+	printf("%s%d ACME TXT record(s) deleted!\n", ($deleted ? "\n" : ""), $deleted);
+}
+else
+{
+	// Split domain name to subdomains.
+	$hostparts = explode('.', $hostname);
+	$fulldomain = array_pop($hostparts);
+	$recordname = null;
+
+	while(($nextpart = array_pop($hostparts)) !== null)
+	{
+		$fulldomain = sprintf('%s.%s', $nextpart, $fulldomain);
+		if(($domain = $desec->getDomain($fulldomain)) !== false)
+		{
+			// We found the domain! Prepend challenge name.
+			array_unshift($hostparts, '_acme-challenge');
+			$recordname = implode('.', $hostparts);
+			break;
+		}
+	}
+
+	if($recordname === null)
+	{
+		throw new Exception(sprintf('Domain %s does not exist in this account', $hostname));
+	}
+
+	$txtvalue = sprintf('"%s"', $recordvalue);
+	$result = $desec->getRecord($fulldomain, $recordname, 'TXT');
+	$records = !empty($result[0]['records']) ? $result[0]['records'] : [];
+
+	if(!is_array($records))
+	{
+		throw new RuntimeException('Invalid API response');
+	}
+
+	if($mode === 'add')
+	{
+		$records[] = $txtvalue;
+		$method = $result ? 'updateRecord' : 'createRecord';
+		$desec->{$method}($fulldomain, $recordname, 'TXT', $records);
+	}
+	else if($result)
+	{
+		if($recordvalue === null)
+		{
+			$desec->deleteRecord($fulldomain, $recordname, 'TXT');
+		}
+		else if(($key = array_search($txtvalue, $records, true)) !== false)
+		{
+			unset($records[$key]);
+
+			$desec->updateRecord($fulldomain, $recordname, 'TXT', $records);
+		}
+	}
+}
+
+// Close API...
+unset($desec);
+
+// and quit...
+exit(0);
+
+########################################################################
+#                            EXTERNAL LIBS                             #
+########################################################################
+
+function idn_to_utf8_wrapper($domain)
+{
+	$domain = (string) $domain;
+
+	if(!function_exists('idn_to_utf8'))
+	{
+		return $domain;
+	}
+	else if(defined('INTL_IDNA_VARIANT_UTS46'))
+	{
+		return idn_to_utf8($domain, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46);
+	}
+
+	return idn_to_utf8($domain);
+}
+
+// Convert PHP errors to exceptions. This is very usefull!
+function error_handler($severity, $message, $file, $line)
+{
+	if(!(error_reporting() & $severity))
+	{
+		return;
+	}
+
+	throw new ErrorException($message, 0, $severity, $file, $line);
+}
+
+// Minimal API implementation for deSEC
+// by Christian Schrötter <cs@fnx.li>
+class deSEC
+{
+	private $curl  = null;
+	private $token = null;
+
+	public function __construct()
+	{
+		$this->curl = curl_init();
+		$this->initializeOptions();
+	}
+
+	public function __destruct()
+	{
+		if($this->curl !== null)
+		{
+			curl_close($this->curl);
+			unset($this->curl); # ?
+		}
+	}
+
+	public function setAuthData($token)
+	{
+		$this->token = (string) $token;
+
+		$this->setOpt
+		(
+			CURLOPT_HTTPHEADER,
+			[
+				'Accept: application/json',
+				'Content-Type: application/json',
+				'Authorization: Token ' . $this->token,
+			]
+		);
+	}
+
+	private function initializeOptions()
+	{
+		$this->setOpt(CURLOPT_TIMEOUT, 30);
+		$this->setOpt(CURLOPT_RETURNTRANSFER, true);
+		$this->setOpt(CURLOPT_SSL_VERIFYPEER, true);
+	}
+
+	private function setOpt($key, $value)
+	{
+		if(!curl_setopt($this->curl, (string) $key, $value))
+		{
+			throw new Exception('Could not set cURL option ' . $key);
+		}
+	}
+
+	public function doRequest($url, $method = 'GET', $data = [])
+	{
+		$url    = sprintf('https://desec.io/api/v1/domains/%s', $url);
+		$method = strtoupper($method);
+		$json   = json_encode($data);
+
+		$this->setOpt(CURLOPT_URL, $url);
+
+		switch($method)
+		{
+			case 'DELETE':
+			case 'GET':
+				$this->setOpt(CURLOPT_CUSTOMREQUEST, $method);
+				$this->setOpt(CURLOPT_POSTFIELDS, null);
+
+				if($data)
+				{
+					throw new InvalidArgumentException('Data is not supported at this method');
+				}
+				break;
+
+			case 'DELETE':
+			case 'PATCH':
+			case 'POST':
+			case 'PUT':
+				$this->setOpt(CURLOPT_CUSTOMREQUEST, $method);
+				$this->setOpt(CURLOPT_POSTFIELDS, $json);
+				break;
+
+			default:
+				throw new InvalidArgumentException('Unsupported method');
+		}
+
+		syslog(LOG_INFO, sprintf('%s %s: %s', $method, $url, $json));
+
+		if(($result = curl_exec($this->curl)) === false)
+		{
+			throw new RuntimeException(curl_error($this->curl), curl_errno($this->curl));
+		}
+		else if(!in_array(($code = curl_getinfo($this->curl,  CURLINFO_RESPONSE_CODE)), [200, 204], true))
+		{
+			throw new deSECException(null, $code);
+		}
+
+		return json_decode($result, true);
+	}
+
+	public function getDomain($domain)
+	{
+		try
+		{
+			return $this->doRequest(idn_to_utf8_wrapper($domain) . '/');
+		}
+		catch(deSECException $e)
+		{
+			if($e->getCode() === 404)
+			{
+				return false;
+			}
+
+			throw $e;
+		}
+	}
+
+	public function getRecord($domain, $name = null, $type = null)
+	{
+		# TODO: Implement pagination!
+		# ...
+
+		try
+		{
+			$query = http_build_query
+			(
+				[
+					'subname' => $name,
+					'type'    => $type,
+				],
+				'',
+				'&'
+			);
+
+			return $this->doRequest
+			(
+				idn_to_utf8_wrapper($domain) . '/rrsets/' .
+				(
+					$query !== ''
+					? '?' . $query
+					: ''
+				)
+			);
+		}
+		catch(deSECException $e)
+		{
+			if($e->getCode() === 201)
+			{
+				return true;
+			}
+			else if($e->getCode() === 404)
+			{
+				return false;
+			}
+
+			throw $e;
+		}
+
+		throw new RuntimeException('Could not get record');
+	}
+
+	public function deleteRecord($domain, $name, $type)
+	{
+		return $this->updateRecord($domain, $name, $type);
+	}
+
+	public function createRecord($domain, $name, $type, $content, $ttl = 3600)
+	{
+		$this->prepareRecord($domain, $name, $type, $content, $ttl);
+
+		try
+		{
+			return $this->doRequest
+			(
+				idn_to_utf8_wrapper($domain) . '/rrsets/',
+				'POST',
+				(object)
+				[
+					'subname' => $name,
+					'type'    => $type,
+					'records' => $content,
+					'ttl'     => $ttl,
+				]
+			);
+		}
+		catch(deSECException $e)
+		{
+			if($e->getCode() === 201)
+			{
+				return true;
+			}
+
+			throw $e;
+		}
+
+		throw new RuntimeException('Could not add record');
+	}
+
+	public function updateRecord($domain, $name, $type, $content = [], $ttl = 3600)
+	{
+		$this->prepareRecord($domain, $name, $type, $content, $ttl);
+
+		return $this->doRequest
+		(
+			sprintf('%s/rrsets/%s/%s/', idn_to_utf8_wrapper($domain), rawurlencode($name), rawurlencode($type)),
+			'PUT',
+			(object)
+			[
+				'subname' => $name,
+				'type'    => $type,
+				'records' => $content,
+				'ttl'     => $ttl,
+			]
+		);
+	}
+
+	private function prepareRecord(&$domain, &$name, &$type, &$content, &$ttl)
+	{
+		if($ttl < 3600)
+		{
+			throw new InvalidArgumentException('TTL is lower than 3600');
+		}
+		else if(!is_array($content))
+		{
+			$content = [$content];
+		}
+
+		$content = array_values(array_unique($content));
+		$type = strtoupper($type);
+	}
+}
+
+class deSECException extends RuntimeException
+{
+	public function __construct($message = '', $code = 0, $previous = null)
+	{
+		if($message === null && $code)
+		{
+			$message = sprintf('API request failed: HTTP Error %d', $code);
+		}
+
+		parent::__construct($message, $code, $previous);
+	}
+}
+
+?>
