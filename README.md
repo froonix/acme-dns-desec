@@ -12,7 +12,7 @@ Run it for the first time:
 
 ```bash
 # Add the TXT record _acme-challenge.example.com
-# with value "test" and set TTL to 300 seconds:
+# with value "test" and set TTL to 3600 seconds:
 ./scripts/acme-dns-desec --add "example.com" "test"
 
 # Check your nameserver: (wait some time)
