@@ -124,7 +124,8 @@ if($mode === 'cleanup')
 	$deleted = 0;
 	foreach($domains as $domain)
 	{
-		$result = $desec->getRecord($domain, null, 'TXT');
+		$result = $desec->getRecords($domain, null, 'TXT');
+		$delete = [];
 
 		if(is_array($result))
 		{
@@ -133,10 +134,15 @@ if($mode === 'cleanup')
 				if(preg_match('/^_acme-challenge(\..+|$)/', $rr['subname']))
 				{
 					printf("Deleting TXT record for %s: %s\n", $rr['subname'], implode(' ', $rr['records']));
-					$desec->deleteRecord($rr['domain'], $rr['subname'], $rr['type']);
-					$deleted++;
+					$delete[] = ['domain' => $rr['domain'], 'name' => $rr['subname'], 'type' => $rr['type']];
 				}
 			}
+		}
+
+		if(($c = count($delete)))
+		{
+			$desec->deleteRecords($delete);
+			$deleted += $c;
 		}
 	}
 
@@ -167,7 +173,7 @@ else
 	}
 
 	$txtvalue = sprintf('"%s"', $recordvalue);
-	$result = $desec->getRecord($fulldomain, $recordname, 'TXT');
+	$result = $desec->getRecords($fulldomain, $recordname, 'TXT');
 	$records = !empty($result[0]['records']) ? $result[0]['records'] : [];
 
 	if(!is_array($records))
@@ -237,8 +243,15 @@ function error_handler($severity, $message, $file, $line)
 // by Christian Schrötter <cs@fnx.li>
 class deSEC
 {
-	private $curl  = null;
-	private $token = null;
+	const RETRY_COUNT =      3; // retry failed requests
+	const RETRY_TIME  =     10; // max sleep() at rate limit
+	const MAX_PAGES   =    100; // max supported page count
+	const PAGE_SLEEP  = 250000; // usleep() after each page
+	const DEFAULT_TTL =   3600; // default TTL for records
+
+	private $curl   = null;
+	private $token  = null;
+	private $header = null;
 
 	public function __construct()
 	{
@@ -272,7 +285,8 @@ class deSEC
 
 	private function initializeOptions()
 	{
-		$this->setOpt(CURLOPT_TIMEOUT, 30);
+		$this->setOpt(CURLOPT_TIMEOUT,          30);
+		$this->setOpt(CURLOPT_HEADER,         true);
 		$this->setOpt(CURLOPT_RETURNTRANSFER, true);
 		$this->setOpt(CURLOPT_SSL_VERIFYPEER, true);
 	}
@@ -285,9 +299,14 @@ class deSEC
 		}
 	}
 
-	public function doRequest($url, $method = 'GET', $data = [])
+	public function doRequest($request, $method = 'GET', $data = [], $try = 0)
 	{
-		$url    = sprintf('https://desec.io/api/v1/domains/%s', $url);
+		if($try > self::RETRY_COUNT)
+		{
+			throw new RuntimeException(sprintf('Retry limit (%d) reached', self::RETRY_COUNT));
+		}
+
+		$url    = sprintf('https://desec.io/api/v1/domains/%s', $request);
 		$method = strtoupper($method);
 		$json   = json_encode($data);
 
@@ -324,12 +343,62 @@ class deSEC
 		{
 			throw new RuntimeException(curl_error($this->curl), curl_errno($this->curl));
 		}
-		else if(!in_array(($code = curl_getinfo($this->curl,  CURLINFO_RESPONSE_CODE)), [200, 204], true))
+		else if(!($size = curl_getinfo($this->curl, CURLINFO_HEADER_SIZE)))
 		{
-			throw new deSECException(null, $code);
+			throw new RuntimeException('Invalid header size');
 		}
 
-		return json_decode($result, true);
+		$header = substr($result, 0, $size);
+		$result = substr($result, $size);
+
+		$this->header = [];
+		foreach(explode("\n", trim($header)) as $line)
+		{
+			$line = trim($line);
+
+			if(($pos = strpos($line, ':')) !== false)
+			{
+				$key   = strtolower(trim(substr($line, 0, $pos)));
+				$value = trim(substr($line, $pos + 1));
+
+				if($key !== '')
+				{
+					$this->header[$key] = $value;
+				}
+			}
+		}
+
+		$return = json_decode($result, true);
+
+		if(!in_array(($code = curl_getinfo($this->curl, CURLINFO_RESPONSE_CODE)), [200, 204], true))
+		{
+			if($code === 429 && isset($this->header['retry-after']) && ($try + 1) <= self::RETRY_COUNT)
+			{
+				$time = time();
+
+				if(is_numeric($this->header['retry-after']))
+				{
+					$retry = $time + abs((int) $this->header['retry-after']);
+				}
+				else
+				{
+					$retry = (int) strtotime($this->header['retry-after']);
+				}
+
+				if($retry > $time && ($retry - $time) <= self::RETRY_TIME)
+				{
+					syslog(LOG_DEBUG, sprintf('Rate limit reached! Next try in %d second(s)...', $retry - $time));
+
+					sleep($retry - $time + 1);
+
+					return $this->doRequest($request, $method, $data, $try + 1);
+				}
+			}
+
+			throw new deSECException(isset($return['detail']) ? $return['detail'] : null, $code);
+		}
+
+		return $return;
 	}
 
 	public function getDomain($domain)
@@ -349,29 +418,76 @@ class deSEC
 		}
 	}
 
-	public function getRecord($domain, $name = null, $type = null)
+	public function getRecords($domain, $name = null, $type = null)
 	{
 		try
 		{
-			$query = http_build_query
-			(
-				[
-					'subname' => $name,
-					'type'    => $type,
-				],
-				'',
-				'&'
-			);
+			$i      = 0;
+			$buffer = [];
+			$cursor = null;
+			do
+			{
+				if(++$i > self::MAX_PAGES)
+				{
+					throw new RuntimeException(sprintf('There are more than %d pages?! Sounds like a bug...', self::MAX_PAGES));
+				}
 
-			return $this->doRequest
-			(
-				idn_to_utf8_wrapper($domain) . '/rrsets/' .
+				$query = http_build_query
 				(
-					$query !== ''
-					? '?' . $query
-					: ''
-				)
-			);
+					[
+						'subname' =>          $name,
+						'type'    =>          $type,
+						'cursor'  => (string) $cursor,
+					],
+					'',
+					'&'
+				);
+
+				$oldCursor  = $cursor;
+				$nextCursor = null;
+				$cursor     = null;
+
+				if(!is_array($result = $this->doRequest(idn_to_utf8_wrapper($domain) . '/rrsets/?' . $query)))
+				{
+					return false;
+				}
+
+				$buffer = array_merge($buffer, $result);
+
+				if(isset($this->header['link']))
+				{
+					foreach(explode(',', $this->header['link']) as $link)
+					{
+						$link    = trim($link);
+						$matches = null;
+						$args    = null;
+
+						if(preg_match('#^<([^>]+)>; rel="([^"]+)"$#', $link, $matches))
+						{
+							if($matches[2] === 'next' && ($query = parse_url($matches[1], PHP_URL_QUERY)) !== false)
+							{
+								parse_str($query, $args);
+
+								if(!isset($args['cursor']) || $args['cursor'] === '')
+								{
+									throw new RuntimeException('Missing or empty cursor argment in link response header');
+								}
+
+								$nextCursor = $args['cursor'];
+							}
+						}
+					}
+				}
+
+				if($nextCursor !== null && $nextCursor !== $oldCursor)
+				{
+					$cursor = $nextCursor;
+					usleep(self::PAGE_SLEEP);
+				}
+			}
+			while($cursor !== null);
+
+			return $buffer;
 		}
 		catch(deSECException $e)
 		{
@@ -395,24 +511,45 @@ class deSEC
 		return $this->updateRecord($domain, $name, $type);
 	}
 
-	public function createRecord($domain, $name, $type, $content, $ttl = 3600)
+	public function deleteRecords($rrs)
 	{
-		$this->prepareRecord($domain, $name, $type, $content, $ttl);
+		return $this->updateRecords
+		(
+			array_map
+			(
+				function($_)
+				{
+					$_['content'] = [];
+					unset($_['ttl']);
+
+					return $_;
+				},
+				$rrs
+			)
+		);
+	}
+
+	public function createRecord($domain, $name, $type, $content, $ttl = self::DEFAULT_TTL)
+	{
+		return $this->createRecords([['domain' => $domain, 'name' => $name, 'type' => $type, 'content' => $content, 'ttl' => $ttl]]);
+	}
+
+	public function createRecords($rrs)
+	{
+		$data = $this->prepareRecords($rrs, true);
 
 		try
 		{
-			return $this->doRequest
-			(
-				idn_to_utf8_wrapper($domain) . '/rrsets/',
-				'POST',
-				(object)
-				[
-					'subname' => $name,
-					'type'    => $type,
-					'records' => $content,
-					'ttl'     => $ttl,
-				]
-			);
+			$state = true;
+			foreach($data as $domain => $rrs)
+			{
+				if(!($_ = $this->doRequest(idn_to_utf8_wrapper($domain) . '/rrsets/', 'POST', $rrs)))
+				{
+					$state = false;
+				}
+			}
+
+			return $state;
 		}
 		catch(deSECException $e)
 		{
@@ -424,32 +561,34 @@ class deSEC
 			throw $e;
 		}
 
-		throw new RuntimeException('Could not add record');
+		throw new RuntimeException('Could not add record(s)');
 	}
 
-	public function updateRecord($domain, $name, $type, $content = [], $ttl = 3600)
+	public function updateRecord($domain, $name, $type, $content = [], $ttl = self::DEFAULT_TTL)
 	{
-		$this->prepareRecord($domain, $name, $type, $content, $ttl);
+		return $this->updateRecords([['domain' => $domain, 'name' => $name, 'type' => $type, 'content' => $content, 'ttl' => $ttl]]);
+	}
 
-		return $this->doRequest
-		(
-			sprintf('%s/rrsets/%s/%s/', idn_to_utf8_wrapper($domain), rawurlencode($name), rawurlencode($type)),
-			'PUT',
-			(object)
-			[
-				'subname' => $name,
-				'type'    => $type,
-				'records' => $content,
-				'ttl'     => $ttl,
-			]
-		);
+	public function updateRecords($rrs)
+	{
+		$state = true;
+		$data = $this->prepareRecords($rrs);
+		foreach($data as $domain => $rrs)
+		{
+			if(!($_ = $this->doRequest(idn_to_utf8_wrapper($domain) . '/rrsets/', 'PUT', $rrs)))
+			{
+				$state = false;
+			}
+		}
+
+		return $state;
 	}
 
 	private function prepareRecord(&$domain, &$name, &$type, &$content, &$ttl)
 	{
-		if($ttl < 3600)
+		if($ttl < self::DEFAULT_TTL)
 		{
-			throw new InvalidArgumentException('TTL is lower than 3600');
+			throw new InvalidArgumentException(sprintf('TTL is lower than %d', self::DEFAULT_TTL));
 		}
 		else if(!is_array($content))
 		{
@@ -458,6 +597,43 @@ class deSEC
 
 		$content = array_values(array_unique($content));
 		$type = strtoupper($type);
+	}
+
+	private function prepareRecords($rrs, $create = false)
+	{
+		if(!is_array($rrs))
+		{
+			throw new InvalidArgumentException();
+		}
+
+		$data = [];
+		foreach($rrs as $rr)
+		{
+			if(!is_array($rr) || !isset($rr['domain'], $rr['name'], $rr['type']))
+			{
+				throw new InvalidArgumentException('Invalid element');
+			}
+
+			$rr['content'] = isset($rr['content']) ? $rr['content'] : [];
+			$rr['ttl'] = isset($rr['ttl']) ? $rr['ttl'] : self::DEFAULT_TTL;
+
+			if($create && !$rr['content'])
+			{
+				throw new InvalidArgumentException();
+			}
+
+			$this->prepareRecord($rr['domain'], $rr['name'], $rr['type'], $rr['content'], $rr['ttl']);
+
+			$data[$rr['domain']][] = (object)
+			[
+				'subname' => $rr['name'],
+				'type'    => $rr['type'],
+				'records' => $rr['content'],
+				'ttl'     => $rr['ttl'],
+			];
+		}
+
+		return $data;
 	}
 }
 
