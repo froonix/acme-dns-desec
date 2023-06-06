@@ -34,7 +34,7 @@ $base = array_shift($argv);
 if(isset($argv[0]) && substr($argv[0], 0, 2) === '--')
 {
 	$_ = substr(array_shift($argv), 2);
-	if(in_array($_, ['add', 'del', 'cleanup'], true))
+	if(in_array($_, ['add', 'del', 'cleanup', 'export'], true))
 	{
 		$mode = $_;
 	}
@@ -49,7 +49,7 @@ else if(isset($argv[0]))
 	$mode = 'del';
 }
 
-if($mode === 'cleanup')
+if(in_array($mode, ['cleanup', 'export'], true))
 {
 	$domains = $argv;
 
@@ -74,6 +74,7 @@ if($mode === null || ($mode === 'add' && ($hostname === null || $recordvalue ===
 	print("[ACME-DNS-DESEC] dns-01 challenge helper script for deSEC.io DNS API\n");
 	printf("Usage: %s [--{add|del}] <hostname> [<txtvalue>]\n", $base);
 	printf("       %s --cleanup <domain> ...\n\n", $base);
+	printf("       %s --export <domain> ...\n\n", $base);
 	print("_acme-challenge will be prepended to the hostname. Subdomains are fully supported.\n");
 	print("Without a txtvalue, the corresponding record will be deleted! TTL is set to 3600.\n\n");
 	print("There are --add/--del arguments too. They are only supported as first argument!\n");
@@ -96,10 +97,12 @@ if($mode === null || ($mode === 'add' && ($hostname === null || $recordvalue ===
 	printf("  %s example.org\n\n", $base);
 	print("  # Delete all challenge records at example.org (incl. subdomains)\n");
 	printf("  %s --cleanup example.org\n\n", $base);
+	print("  # Create backup of example.org zone\n");
+	printf("  %s --export example.org\n\n", $base);
 	exit(1);
 }
 
-if($mode !== 'cleanup')
+if(!in_array($mode, ['cleanup', 'export']))
 {
 	$hostname = strtolower($hostname);
 	if(substr($hostname, 0, 16) === '_acme-challenge.')
@@ -147,6 +150,19 @@ if($mode === 'cleanup')
 	}
 
 	printf("%s%d ACME TXT record(s) deleted!\n", ($deleted ? "\n" : ""), $deleted);
+}
+else if($mode === 'export')
+{
+	$i = 0;
+	foreach($domains as $domain)
+	{
+		if($i++)
+		{
+			printf("\n; %1\$s\n; %1\$s\n\n", str_repeat('-', 70));
+		}
+
+		print(trim($desec->export($domain)) . "\n");
+	}
 }
 else
 {
@@ -299,7 +315,7 @@ class deSEC
 		}
 	}
 
-	public function doRequest($request, $method = 'GET', $data = [], $try = 0)
+	public function doRequest($request, $method = 'GET', $data = [], $plain = false, $try = 0)
 	{
 		if($try > self::RETRY_COUNT)
 		{
@@ -368,7 +384,7 @@ class deSEC
 			}
 		}
 
-		$return = json_decode($result, true);
+		$return = !$plain ? json_decode($result, true) : null;
 
 		if(!in_array(($code = curl_getinfo($this->curl, CURLINFO_RESPONSE_CODE)), [200, 204], true))
 		{
@@ -391,14 +407,19 @@ class deSEC
 
 					sleep($retry - $time + 1);
 
-					return $this->doRequest($request, $method, $data, $try + 1);
+					return $this->doRequest($request, $method, $data, $plain, $try + 1);
 				}
 			}
 
 			throw new deSECException(isset($return['detail']) ? $return['detail'] : null, $code);
 		}
 
-		return $return;
+		return !$plain ? $return : $result;
+	}
+
+	public function export($domain)
+	{
+		return $this->doRequest(idn_to_utf8_wrapper($domain) . '/zonefile/', 'GET', [], true);
 	}
 
 	public function getDomain($domain)
